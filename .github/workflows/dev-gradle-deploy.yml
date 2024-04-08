@@ -1,0 +1,132 @@
+name: dev-gradle-deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  REPO_PATH: ${{github.repository}}
+  GIT_BRANCH: ${{github.ref_name}}
+  AUTHOR: ${{github.actor}}
+  JAR_FILE: build/libs/*.jar # for Gradle
+  ENV_NAME: DEV # any of DEV, QA, PROD
+
+jobs:
+  build-push-deploy:
+    runs-on: [self-hosted, linux] # self-hosted runner for DO NOT use public build infrastructure
+    environment:
+      name: DEV
+    steps:
+      - name: Set environment variables
+        run: |
+          REPO_NAME=$(basename $REPO_PATH)
+          echo "REPO_NAME=$REPO_NAME" | tee -a $GITHUB_ENV
+          
+          GIT_COMMIT_ID=$(git rev-parse --short HEAD)
+          echo "GIT_COMMIT_ID=$GIT_COMMIT_ID" | tee -a $GITHUB_ENV
+
+          BUILD_VERSION=${{env.GIT_BRANCH}}-$(date +%Y%m%d)-$GIT_COMMIT_ID
+          echo "BUILD_VERSION=$BUILD_VERSION" | tee -a $GITHUB_ENV
+
+          ENV_NAME=${{env.ENV_NAME}}
+          echo "ENV_NAME=$ENV_NAME" | tee -a $GITHUB_ENV
+
+          NAMESPACE=$(echo $REPO_NAME-$ENV_NAME | sed 's/[ .]/-/g' | tr '[:upper:]' '[:lower:]')
+          echo "NAMESPACE=$NAMESPACE" | tee -a $GITHUB_ENV
+
+          AUTHOR=${{env.AUTHOR}}
+          echo "AUTHOR=$AUTHOR" | tee -a $GITHUB_ENV
+
+      - name: Verify environment variables
+        run: |
+          echo REPO_NAME="${{ env.REPO_NAME }}"
+          echo NAMESPACE="${{ env.NAMESPACE }}"
+          echo GIT_COMMIT_ID="${{ env.GIT_COMMIT_ID }}"
+          echo BUILD_VERSION="${{ env.BUILD_VERSION }}"
+          echo ENV_NAME="${{ env.ENV_NAME }}"
+          echo AUTHOR="${{ env.AUTHOR }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build with Gradle
+        run: |
+          echo PATH=$PATH
+          chmod +x ./gradlew
+          ./gradlew --version
+          ./gradlew build
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          logout: false
+
+      - name: Build and Push Docker Image to DockerHub
+        run: |
+          DOCKERHUB_PATH=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.REPO_NAME }}
+          echo DOCKERHUB_PATH=$DOCKERHUB_PATH
+          echo "DOCKERHUB_PATH=$DOCKERHUB_PATH" >> $GITHUB_ENV
+
+          echo start building image $DOCKERHUB_PATH:$VERSION ...
+          echo pwd=$(pwd)
+          docker build \
+            --build-arg ENV_NAME=${{env.ENV_NAME}} \
+            --build-arg BUILD_VERSION=${{ env.BUILD_VERSION }} \
+            --build-arg REPO_NAME=${{ env.REPO_NAME }} \
+            --build-arg JAR_FILE=${{env.JAR_FILE}} \
+            --build-arg AUTHOR=${{env.AUTHOR}} \
+            --build-arg NAMESPACE=${{env.NAMESPACE}} \
+            -t $DOCKERHUB_PATH:${{ env.BUILD_VERSION }} .
+
+          if [ $? -ne 0 ]; then
+            echo "Docker build failed"
+            exit 1
+          fi
+
+          echo built image $DOCKERHUB_PATH:${{ env.BUILD_VERSION }}
+          echo tagging image $DOCKERHUB_PATH:${{ env.BUILD_VERSION }}, $DOCKERHUB_PATH:latest ...
+          docker tag $DOCKERHUB_PATH:${{ env.BUILD_VERSION }} $DOCKERHUB_PATH:latest
+
+          echo pushing image $DOCKERHUB_PATH:latest, $DOCKERHUB_PATH:${{ env.BUILD_VERSION }} ...
+          docker push $DOCKERHUB_PATH:latest
+          if [ $? -ne 0 ]; then
+            # registry doesn't exist, create it
+            curl -X POST -H "Content-Type: application/json" -d '{"name": "$DOCKERHUB_PATH"}' https://hub.docker.com/v2/repositories/create
+            # retry push  
+            docker push $DOCKERHUB_PATH:latest
+          fi
+          docker push $DOCKERHUB_PATH:${{ env.BUILD_VERSION }}
+          if [ $? -ne 0 ]; then
+              echo "Docker push failed in version ${{ env.BUILD_VERSION }}"
+              exit 1
+          fi
+
+      - name: Set KUBECONFIG
+        uses: Azure/k8s-set-context@v4
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+
+      - name: Deploy to Kubernetes
+        run: |
+          echo "*** DEPLOY\nCURRENT DIR=$(pwd)"
+          echo "kubectl apply -f $(pwd)/k8s/${{env.ENV_NAME}}/deployment.yml -n ${{env.NAMESPACE}}"
+          kubectl apply -f $(pwd)/k8s/${{env.ENV_NAME}}/deployment.yml -n ${{env.NAMESPACE}}
+          echo "Waiting for apply changes ..." 
+          sleep 5
+          echo "kubectl get deployments -o wide -n ${{ env.NAMESPACE }}"
+          kubectl get deployments -o wide -n ${{ env.NAMESPACE }}
+
+      - name: Restart using new deployment
+        run: |
+          kubectl scale deployment ${{ env.NAMESPACE }} --replicas=0 -n ${{ env.NAMESPACE }}
+          kubectl scale deployment ${{ env.NAMESPACE }} --replicas=1 -n ${{ env.NAMESPACE }}
+
+      - name: Verify deployment
+        run: |
+          kubectl get deployments -o wide -n ${{ env.NAMESPACE }}
+          kubectl get pods -o wide -n ${{ env.NAMESPACE }}
+          kubectl get svc -o wide -n ${{ env.NAMESPACE }}
+          kubectl get ingress -o wide -n ${{ env.NAMESPACE }}

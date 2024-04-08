@@ -1,0 +1,40 @@
+### PLEASE DO NOT MODIFY THIS FILE
+### THIS IS A TEMPLATE ONLY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quotes-dev
+  namespace: quotes-dev
+  labels:
+    app: quotes-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quotes-dev
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:
+    metadata:
+      name: quotes-dev
+      labels:
+        app: quotes-dev
+    spec:
+      containers:
+        - name: quotes-dev
+          image: cavecafe/quotes:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          securityContext:
+            runAsUser: 1001
+            runAsGroup: 3000
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 60m
+      restartPolicy: Always
